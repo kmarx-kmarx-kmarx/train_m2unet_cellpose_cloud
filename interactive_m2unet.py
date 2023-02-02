@@ -207,6 +207,19 @@ class M2UnetInteractiveModel:
         if self._iterations % self.save_freq == 0:
             self.save()
         return train_loss.item()
+    
+    def get_loss(
+        self,
+        images,
+        targets,
+    ):
+        imgi = torch.from_numpy(images.transpose(0, 3, 1, 2))
+        tgs = torch.from_numpy(targets.transpose(0, 3, 1, 2).astype(np.float32))
+        imgi = imgi.to(device=self.device, dtype=torch.float32)
+        tgs = tgs.to(device=self.device, dtype=torch.float32)
+        masks_pred = self.model(imgi)
+        train_loss = self.criterion(masks_pred, tgs)
+        return train_loss.item(), masks_pred.cpu().detach().numpy()
 
     def train_on_batch(self, X, y):
         """train the model for one iteration

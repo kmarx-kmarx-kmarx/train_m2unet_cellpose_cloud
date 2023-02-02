@@ -24,21 +24,19 @@ def main():
     bucket_source = 'gs://octopi-malaria-tanzania-2021-data'
     local_path = 'data'
     dataset_file = 'list of datasets.txt'
-    n_views_train = 110 # number of views from each dataset to train on
-    n_views_valid = 41  # number of views from each dataset to run validation on
+    save_interval = 10
+    n_views_train = 101 # number of views from each dataset to train on
+    n_views_valid = 50  # number of views from each dataset to run validation on
                         # make (n_views_valid + n_views_train) a prime number for good cross-validation
     random_views = True # randomize the training data
-    erode_mask = 1      # erode mask to improve cell separation
+    erode_mask = 0      # erode mask to improve cell separation
     # illumination correction
     flatfield_left = np.load('flatfield_left.npy')
     flatfield_right = np.load('flatfield_right.npy')
     # m2unet training
     epochs = 1000
-    resume = True
-    corrid = "202"
-    pretrained_model = None
     sz = 1024
-    model_root = "m2unet_model_4"
+    model_root = "m2unet_model_7"
     transform = A.Compose(
         [
             A.RandomCrop(1500, 1500),
@@ -46,7 +44,6 @@ def main():
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.CenterCrop(sz, sz),  
-            A.augmentations.transforms.RandomBrightnessContrast(brightness_limit=0.01, contrast_limit=0.1, brightness_by_max=False, p=0.9),
         ]
     )
     model_config = {
@@ -86,64 +83,73 @@ def main():
     model_un = M2UnetInteractiveModel(
         model_config=model_config,
         model_dir=model_root,
-        resume=resume,
-        pretrained_model=pretrained_model,
-        default_save_path=os.path.join(model_root, str(corrid) + "_model.pth"),
+        resume=False,
+        pretrained_model=None,
+        default_save_path=os.path.join(model_root, "model.pth"),
     )
 
     # start training
     i = 0
-    max_sim = -np.Inf
+    min_loss = np.Inf
+    max_loss = -np.Inf
     for e in trange(epochs):
-        for _ in trange(n_views_train):
+        # losses = np.zeros(n_views_train * len(DATASET_ID))
+        for l in trange(n_views_train):
             i += 1
             i %= imax
-            for dataset in DATASET_ID:
+            for j, dataset in enumerate(DATASET_ID):
                 # get target image
                 im, mask = get_im_mask(i, indices, dataset, fs, bucket_source, flatfield_left, flatfield_right, model_cp, local=local_path)
+                mask = mask/np.max(mask)
                 if erode_mask > 0:
                     shape = cv2.MORPH_ELLIPSE
                     element = cv2.getStructuringElement(shape, (2 * erode_mask + 1, 2 * erode_mask + 1), (erode_mask, erode_mask))
                     mask = np.array(cv2.erode(mask, element))
-                # print(f"im = (im - {np.mean(im)}) /{np.std(im)}")
                 im = (im - np.mean(im)) /np.std(im)
                 im = np.stack([im,]*3, axis=2)
                 labels = model_un.transform_labels(mask)
                 labels = np.expand_dims(labels, axis=0)
                 labels = np.expand_dims(labels, axis=-1)
                 im = np.expand_dims(im, axis=0)
+                k = len(DATASET_ID)*l + j
                 model_un.train_on_batch(im, labels)
-        similarity = np.zeros(n_views_valid * len(DATASET_ID))
+        losses = np.zeros(n_views_valid * len(DATASET_ID))
         for l in trange(n_views_valid):
             i += 1
             i %= imax
             for j, dataset in enumerate(DATASET_ID):
                 # get target image
                 im, mask = get_im_mask(i, indices, dataset, fs, bucket_source, flatfield_left, flatfield_right, model_cp, local=local_path)
+                im = im[:sz, :sz]
+                mask = mask[:sz, :sz]
+                mask = mask/np.max(mask)
                 if erode_mask > 0:
                     shape = cv2.MORPH_ELLIPSE
                     element = cv2.getStructuringElement(shape, (2 * erode_mask + 1, 2 * erode_mask + 1), (erode_mask, erode_mask))
                     mask = np.array(cv2.erode(mask, element))
-                im = im[:sz, :sz]
                 im = (im - np.mean(im)) /np.std(im)
                 im = np.stack([im,]*3, axis=2)
                 im = np.expand_dims(im, axis=0)
-                results = model_un.predict(im)
-
+                mask =  np.stack([mask,], axis=2)
+                mask = np.expand_dims(mask, axis=0)
+                loss, __ = model_un.get_loss(im, mask)
                 k = len(DATASET_ID)*l + j
-                mask = (mask[:sz, :sz]/np.max(mask)).astype(float)
-                results = (results[0][:,:,0]/np.max(mask)).astype(float)
-                similarity[k] = diff(results, mask)
+                losses[k] = loss
         
-        # Look at average similarity - if it's higher than before, save it
-        avg = np.mean(similarity)
-        if avg > max_sim:
-            max_sim = avg
-            model_un.save(file_path=os.path.join(model_root, f"{corrid}_model_{e}_{int(max_sim)}.pth"))
-
+        # Look at average loss - if it's higher than before, save it
+        avg = np.mean(losses) * 100
+        print(f"\n\n{e}: {avg}\n")
+        if avg < min_loss:
+            min_loss = avg
+            model_un.save(file_path=os.path.join(model_root, f"model_{e}_{int(min_loss)}.pth"))
+        elif avg > max_loss:
+            max_loss = avg
+            model_un.save(file_path=os.path.join(model_root, f"model_{e}_{int(max_loss)}.pth"))
+        elif e % save_interval == 0:
+            model_un.save(file_path=os.path.join(model_root, f"model_{e}_{int(avg)}.pth"))
 
     # save at end
-    model_un.save(file_path=os.path.join(model_root, f"{corrid}_model_{e}.pth"))
+    model_un.save(file_path=os.path.join(model_root, f"model_{e}_{int(avg)}.pth"))
 
 def get_im_mask(i, indices, dataset, fs, bucket_source, flatfield_left, flatfield_right, model_cp, local=None):
     idx = indices[dataset][i]
@@ -198,20 +204,6 @@ def load_from_gcs(fs, bucket_source, dataset, file_id, flatfield_left, flatfield
         np.savez(savepath, mask=mask, img=I_DPC)
 
     return I_DPC, mask      
-
-def diff(img1, img2):
-    diff = img1 - img2
-    return -np.sum(np.abs(diff))
-
-def jaccard_sim(img1, img2):
-    n = np.prod(img1.shape)
-    a = img1 * img2
-    b = img1 + img2 - a
-    J = a/b
-    J[np.isnan(J)] = 1
-    j = np.sum(J)/n
-
-    return j    
 
 if __name__ == "__main__":
     main()
