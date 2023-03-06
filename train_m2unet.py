@@ -8,7 +8,9 @@ from utils import *
 from cellpose import models, utils
 import json
 import random
+from skimage.filters import threshold_otsu
 import cv2
+import csv
 # specify the gpu number
 os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import torch
@@ -20,23 +22,23 @@ def main():
     cellpose_model_path = 'cp_dpc_new'
     # gcs data source
     gcs_project = 'soe-octopi'
-    gcs_token = '/home/prakashlab/Documents/kmarx/data-20220317-keys.json'
-    bucket_source = 'gs://octopi-malaria-tanzania-2021-data'
-    local_path = 'data'
+    gcs_token = '/home/prakashlab/Documents/kmarx/data-20220317-keys.json'  
+    bucket_source = "gs://octopi-malaria-tanzania-2021-data/Negative-Donor-Samples"#'gs://octopi-malaria-uganda-2022-data/'
+    local_path = 'data_tanzania'
     dataset_file = 'list of datasets.txt'
-    save_interval = 10
+    save_interval = 50
     n_views_train = 101 # number of views from each dataset to train on
     n_views_valid = 50  # number of views from each dataset to run validation on
                         # make (n_views_valid + n_views_train) a prime number for good cross-validation
     random_views = True # randomize the training data
-    erode_mask = 0      # erode mask to improve cell separation
+    erode_mask = 1      # erode mask to improve cell separation
     # illumination correction
     flatfield_left = np.load('flatfield_left.npy')
     flatfield_right = np.load('flatfield_right.npy')
     # m2unet training
-    epochs = 1000
+    epochs = 2000
     sz = 1024
-    model_root = "m2unet_model_7"
+    model_root = "m2unet_model_flat_less_erode"
     transform = A.Compose(
         [
             A.RandomCrop(1500, 1500),
@@ -66,6 +68,7 @@ def main():
     indices = {}
     for dataset in DATASET_ID:
         # Get the total number of views and create an index dict
+        print(bucket_source + '/' + dataset + '/acquisition parameters.json')
         json_file = fs.cat(bucket_source + '/' + dataset + '/acquisition parameters.json')
         acquisition_parameters = json.loads(json_file)
         n_images = acquisition_parameters['Ny'] * acquisition_parameters['Nx']
@@ -75,7 +78,8 @@ def main():
         indices[dataset] = i
         indices[dataset+'Ny'] = acquisition_parameters['Ny']
         indices[dataset+'Nx'] = acquisition_parameters['Nx']
-    imax = max([len(indices[dataset]) for dataset in DATASET_ID])
+    # We won't see all the views
+    imax = min([len(indices[dataset]) for dataset in DATASET_ID])
     # initialize cellpose
     model_cp = models.CellposeModel(gpu=True, pretrained_model=cellpose_model_path)
 
@@ -92,6 +96,7 @@ def main():
     i = 0
     min_loss = np.Inf
     max_loss = -np.Inf
+    threshold_stack = []
     for e in trange(epochs):
         # losses = np.zeros(n_views_train * len(DATASET_ID))
         for l in trange(n_views_train):
@@ -106,7 +111,7 @@ def main():
                     element = cv2.getStructuringElement(shape, (2 * erode_mask + 1, 2 * erode_mask + 1), (erode_mask, erode_mask))
                     mask = np.array(cv2.erode(mask, element))
                 im = (im - np.mean(im)) /np.std(im)
-                im = np.stack([im,]*3, axis=2)
+                im = np.stack([im,]*1, axis=2)
                 labels = model_un.transform_labels(mask)
                 labels = np.expand_dims(labels, axis=0)
                 labels = np.expand_dims(labels, axis=-1)
@@ -128,11 +133,12 @@ def main():
                     element = cv2.getStructuringElement(shape, (2 * erode_mask + 1, 2 * erode_mask + 1), (erode_mask, erode_mask))
                     mask = np.array(cv2.erode(mask, element))
                 im = (im - np.mean(im)) /np.std(im)
-                im = np.stack([im,]*3, axis=2)
+                im = np.stack([im,]*1, axis=2)
                 im = np.expand_dims(im, axis=0)
                 mask =  np.stack([mask,], axis=2)
                 mask = np.expand_dims(mask, axis=0)
-                loss, __ = model_un.get_loss(im, mask)
+                loss, result = model_un.get_loss(im, mask)
+                threshold_stack.append(threshold_otsu(255*result[0]))
                 k = len(DATASET_ID)*l + j
                 losses[k] = loss
         
@@ -150,60 +156,8 @@ def main():
 
     # save at end
     model_un.save(file_path=os.path.join(model_root, f"model_{e}_{int(avg)}.pth"))
-
-def get_im_mask(i, indices, dataset, fs, bucket_source, flatfield_left, flatfield_right, model_cp, local=None):
-    idx = indices[dataset][i]
-    x = int(idx/indices[dataset+'Nx'])
-    y = idx % indices[dataset+'Ny']
-    k = 0
-    # check if file exists
-    file_id = str(x) + '_' + str(y) + '_' + str(k)
-    filepath = os.path.join(local, f"{dataset}_{file_id}_seg.npz")
-    if os.path.exists(filepath):
-        im, mask = load_from_file(filepath)
-    else:
-        os.makedirs(local, exist_ok=True)
-        im, mask = load_from_gcs(fs, bucket_source, dataset, file_id, flatfield_left, flatfield_right, model_cp, local=local)  
-    
-    return im, mask
-
-def load_from_file(filepath):
-    items = np.load(filepath, allow_pickle=True)
-    return items['img'], items['mask']
-
-def load_from_gcs(fs, bucket_source, dataset, file_id, flatfield_left, flatfield_right, model_cp, local=None):
-    # generate DPC
-    I_BF_left = imread_gcsfs(fs,bucket_source + '/' + dataset + '/0/' + file_id + '_' + 'BF_LED_matrix_left_half.bmp')
-    I_BF_right = imread_gcsfs(fs,bucket_source + '/' + dataset + '/0/' + file_id + '_' + 'BF_LED_matrix_right_half.bmp')
-    if len(I_BF_left.shape)==3: # convert to mono if color
-        I_BF_left = I_BF_left[:,:,1]
-        I_BF_right = I_BF_right[:,:,1]
-    I_BF_left = I_BF_left.astype('float')/255
-    I_BF_right = I_BF_right.astype('float')/255
-    # flatfield correction
-    I_BF_left = I_BF_left/flatfield_left
-    I_BF_right = I_BF_right/flatfield_right
-    I_DPC = generate_dpc(I_BF_left,I_BF_right)
-
-    # cellpose preprocessing
-    im = I_DPC - np.min(I_DPC)
-    im = np.uint8(255 * np.array(im, dtype=np.float64)/float(np.max(im)))
-    # run segmentation
-    mask, flows, styles = model_cp.eval(im, diameter=None)
-
-    outlines = mask * utils.masks_to_outlines(mask)
-    mask = (mask  > 0) * 1.0
-    outlines = (outlines  > 0) * 1.0
-    mask = (mask * (1.0 - outlines) * 255).astype(np.uint8)
-
-    I_DPC = (255*I_DPC).astype(np.uint8)
-
-    if local != None:
-        savepath = os.path.join(local, f"{dataset}_{file_id}_seg.npz")
-        # io.masks_flows_to_seg(I_DPC, mask, flows, 0, savepath, [0,0])
-        np.savez(savepath, mask=mask, img=I_DPC)
-
-    return I_DPC, mask      
+    threshold_stack = np.array(threshold_stack)
+    threshold_stack.tofile(os.path.join(model_root,'thresholds.csv'), sep = '\n')
 
 if __name__ == "__main__":
     main()
