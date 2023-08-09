@@ -23,26 +23,26 @@ def main():
     # gcs data source
     gcs_project = 'soe-octopi'
     gcs_token = '/home/prakashlab/Documents/kmarx/data-20220317-keys.json'  
-    bucket_source = "gs://octopi-malaria-tanzania-2021-data/Negative-Donor-Samples"#'gs://octopi-malaria-uganda-2022-data/'
-    local_path = 'data_tanzania'
+    bucket_source = "gs://octopi-malaria-tanzania-2021-data/Negative-Donor-Samples"#'gs://octopi-malaria-uganda-2022-data'#"gs://octopi-malaria-tanzania-2021-data"#
+    local_path = 'data_sbc_negatve_donor_sample'
     dataset_file = 'list of datasets.txt'
-    save_interval = 50
-    n_views_train = 101 # number of views from each dataset to train on
-    n_views_valid = 50  # number of views from each dataset to run validation on
+    save_interval = 100
+    n_views_train = 17  # number of views from each dataset to train on
+    n_views_valid = 100 # number of views from each dataset to run validation on
                         # make (n_views_valid + n_views_train) a prime number for good cross-validation
     random_views = True # randomize the training data
-    erode_mask = 1      # erode mask to improve cell separation
+    erode_mask = 2      # erode mask to improve cell separation
     # illumination correction
     flatfield_left = np.load('flatfield_left.npy')
     flatfield_right = np.load('flatfield_right.npy')
     # m2unet training
-    epochs = 2000
+    epochs = 30000
     sz = 1024
-    model_root = "m2unet_model_flat_less_erode"
+    model_root = "m2unet_model_flat_erode2_wdecay5_smallbatch"
     transform = A.Compose(
         [
+            A.Rotate(limit=(-10, 10), p=1), # set to -5, 5 for dpc
             A.RandomCrop(1500, 1500),
-            A.Rotate(limit=(-10, 10), p=1),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.CenterCrop(sz, sz),  
@@ -53,7 +53,7 @@ def main():
         "activation": "sigmoid",
         "output_channels": 1,
         "loss": {"name": "BCELoss", "kwargs": {}},
-        "optimizer": {"name": "RMSprop", "kwargs": {"lr": 1e-2, "weight_decay": 1e-8, "momentum": 0.9}},
+        "optimizer": {"name": "RMSprop", "kwargs": {"lr": 1e-2, "weight_decay": 1e-5, "momentum": 0.9}},
         "augmentation": A.to_dict(transform),
     }
 
@@ -79,7 +79,9 @@ def main():
         indices[dataset+'Ny'] = acquisition_parameters['Ny']
         indices[dataset+'Nx'] = acquisition_parameters['Nx']
     # We won't see all the views
-    imax = min([len(indices[dataset]) for dataset in DATASET_ID])
+    lens = [len(indices[dataset]) for dataset in DATASET_ID]
+    imax = min(lens)
+    print(f"{imax} images per dataset will be used; {np.sum(lens)} total ims in these datasets")
     # initialize cellpose
     model_cp = models.CellposeModel(gpu=True, pretrained_model=cellpose_model_path)
 
@@ -98,19 +100,28 @@ def main():
     max_loss = -np.Inf
     threshold_stack = []
     for e in trange(epochs):
-        # losses = np.zeros(n_views_train * len(DATASET_ID))
+        losses = np.zeros(n_views_train * len(DATASET_ID))
         for l in trange(n_views_train):
             i += 1
             i %= imax
             for j, dataset in enumerate(DATASET_ID):
                 # get target image
-                im, mask = get_im_mask(i, indices, dataset, fs, bucket_source, flatfield_left, flatfield_right, model_cp, local=local_path)
+                try:
+                    im, mask = get_im_mask(i, indices, dataset, fs, bucket_source, flatfield_left, flatfield_right, model_cp, local=local_path)
+                except FileNotFoundError:
+                    print(f"dataset {dataset} index {indices[dataset][i]} not found")
+                    raise FileNotFoundError
+                except:
+                    print("some other error")
+                    raise UserWarning
                 mask = mask/np.max(mask)
-                if erode_mask > 0:
+                # normalize image
+                im = normalize(im)
+                if erode_mask >= 0:
                     shape = cv2.MORPH_ELLIPSE
                     element = cv2.getStructuringElement(shape, (2 * erode_mask + 1, 2 * erode_mask + 1), (erode_mask, erode_mask))
                     mask = np.array(cv2.erode(mask, element))
-                im = (im - np.mean(im)) /np.std(im)
+                # im = (im - np.mean(im)) /np.std(im)
                 im = np.stack([im,]*1, axis=2)
                 labels = model_un.transform_labels(mask)
                 labels = np.expand_dims(labels, axis=0)
@@ -125,14 +136,18 @@ def main():
             for j, dataset in enumerate(DATASET_ID):
                 # get target image
                 im, mask = get_im_mask(i, indices, dataset, fs, bucket_source, flatfield_left, flatfield_right, model_cp, local=local_path)
-                im = im[:sz, :sz]
-                mask = mask[:sz, :sz]
+                transformed = model_un.transform(image=im, mask=mask)
+                im = transformed["image"]
+                mask = transformed["mask"]
+                # normalize iamge
+                im = normalize(np.array(im))
+                mask = np.array(mask)
                 mask = mask/np.max(mask)
-                if erode_mask > 0:
+                if erode_mask >= 0:
                     shape = cv2.MORPH_ELLIPSE
                     element = cv2.getStructuringElement(shape, (2 * erode_mask + 1, 2 * erode_mask + 1), (erode_mask, erode_mask))
                     mask = np.array(cv2.erode(mask, element))
-                im = (im - np.mean(im)) /np.std(im)
+                # im = (im - np.mean(im)) /np.std(im)
                 im = np.stack([im,]*1, axis=2)
                 im = np.expand_dims(im, axis=0)
                 mask =  np.stack([mask,], axis=2)
@@ -142,7 +157,7 @@ def main():
                 k = len(DATASET_ID)*l + j
                 losses[k] = loss
         
-        # Look at average loss - if it's higher than before, save it
+        # Look at average loss - if it's higher/lower than before, save it
         avg = np.mean(losses) * 100
         print(f"\n\n{e}: {avg}\n")
         if avg < min_loss:
@@ -158,6 +173,10 @@ def main():
     model_un.save(file_path=os.path.join(model_root, f"model_{e}_{int(avg)}.pth"))
     threshold_stack = np.array(threshold_stack)
     threshold_stack.tofile(os.path.join(model_root,'thresholds.csv'), sep = '\n')
+
+def normalize(image, mean=127, std=24):
+    # image = (image - mean)/std
+    return image
 
 if __name__ == "__main__":
     main()
